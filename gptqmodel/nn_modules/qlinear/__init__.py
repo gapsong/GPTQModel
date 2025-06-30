@@ -439,44 +439,63 @@ class PackableQuantLinear(BaseQuantLinear):
 
     def dequantize_weight(self, num_itr: int = 1):
         if self.bits in [2, 4, 8]:
-            zeros = t.bitwise_right_shift(
-                t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
-                self.wf_unsqueeze_zero  # self.wf.unsqueeze(0),
-            ).to(self.dequant_dtype)
-            zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
+            # Check if qzeros are already in FP16 format (from QALoRA merge)
+            if self.qzeros.dtype == t.float16:
+                # Use FP16 qzeros directly - these already contain the LoRA shift
+                zeros = self.qzeros
+            else:
+                # Original packed integer qzeros - unpack them
+                zeros = t.bitwise_right_shift(
+                    t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
+                    self.wf_unsqueeze_zero
+                ).to(self.dequant_dtype)
+                zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
 
             weight = t.bitwise_and(
                 t.bitwise_right_shift(
                     t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1),
-                    self.wf_unsqueeze_neg_one  # self.wf.unsqueeze(-1)
+                    self.wf_unsqueeze_neg_one
                 ).to(self.dequant_dtype),
                 self.maxq
             )
         elif self.bits == 3:
-            zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(
-                -1, -1, -1, 12
-            )
-            zeros = zeros >> self.wf_unsqueeze_zero  # self.wf.unsqueeze(0)
-            zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
-            zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
-            zeros = zeros & 0x7
-            zeros = t.cat(
-                [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
-                dim=2,
-            ).reshape(self.scales.shape)
+            # Check if qzeros are already in FP16 format (from QALoRA merge)
+            if self.qzeros.dtype == t.float16:
+                # Use FP16 qzeros directly
+                zeros = self.qzeros
+            else:
+                # Original packed integer qzeros - unpack them
+                zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(
+                    -1, -1, -1, 12
+                )
+                zeros = zeros >> self.wf_unsqueeze_zero
+                zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
+                zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
+                zeros = zeros & 0x7
+                zeros = t.cat(
+                    [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
+                    dim=2,
+                ).reshape(self.scales.shape)
 
             weight = self.qweight.reshape(self.qweight.shape[0] // 3, 3, 1, self.qweight.shape[1]).expand(
                 -1, -1, 12, -1
             )
-            weight = (weight >> self.wf_unsqueeze_neg_one) & 0x7  # self.wf.unsqueeze(-1)
+            weight = (weight >> self.wf_unsqueeze_neg_one) & 0x7
             weight[:, 0, 10] = (weight[:, 0, 10] & 0x3) | ((weight[:, 1, 0] << 2) & 0x4)
             weight[:, 1, 11] = (weight[:, 1, 11] & 0x1) | ((weight[:, 2, 0] << 1) & 0x6)
             weight = weight & 0x7
             weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
+
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
         if num_itr == 1:
-            weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
+            # KEY CHANGE: Different formula based on qzeros format
+            if self.qzeros.dtype == t.float16:
+                # FP16 qzeros already contain the LoRA shift and are in weight space
+                weights = self.scales[self.g_idx.long()] * weight - zeros[self.g_idx.long()]
+            else:
+                # Original quantized qzeros
+                weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
         else:
             num_dim = self.g_idx.shape[0] // num_itr
             weights = []
@@ -485,7 +504,14 @@ class PackableQuantLinear(BaseQuantLinear):
                 weight_i = weight[:, i * num_dim: (i + 1) * num_dim]
                 zeros_i = zeros[:, i * num_dim: (i + 1) * num_dim]
                 g_idx_i = self.g_idx[i * num_dim: (i + 1) * num_dim].long()
-                weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
+                
+                # KEY CHANGE: Different formula based on qzeros format
+                if self.qzeros.dtype == t.float16:
+                    # FP16 qzeros already contain the LoRA shift and are in weight space
+                    weights.append(scale_i[g_idx_i] * weight_i - zeros_i[g_idx_i])
+                else:
+                    # Original quantized qzeros
+                    weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
             weights = t.cat(weights, dim=1)
 
         return weights
