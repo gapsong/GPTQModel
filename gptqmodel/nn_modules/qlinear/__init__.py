@@ -126,16 +126,26 @@ class BaseQuantLinear(nn.Module):
                 "qweight",
                 t.zeros((in_features // self.pack_dtype_bits * self.bits, out_features), dtype=self.pack_dtype),
             )
+            
+            if True:
+                # HIER DIE KORREKTE "LEGACY" DIMENSION FÜR QZEROS BERECHNEN
+                # Dies ist nur ein Beispiel, passen Sie es an Ihre Bedürfnisse an.
+                qzeros_shape = (
+                    math.ceil(in_features / self.group_size),
+                    out_features, # Beispiel: Annahme, dass out_features nicht gepackt ist
+                )
+            else:
+                # Standard-Berechnung
+                qzeros_shape = (
+                    math.ceil(in_features / self.group_size),
+                    out_features // self.pack_dtype_bits * self.bits,
+                )
+
             self.register_buffer(
                 "qzeros",
-                t.zeros(
-                    (
-                        math.ceil(in_features / self.group_size),
-                        out_features // self.pack_dtype_bits * self.bits,
-                    ),
-                    dtype=self.pack_dtype,
-                ),
+                t.zeros(qzeros_shape, dtype=self.pack_dtype),
             )
+            
             self.register_buffer(
                 "scales",
                 t.zeros(
