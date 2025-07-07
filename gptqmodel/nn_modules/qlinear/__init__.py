@@ -31,6 +31,7 @@ from ...utils.logger import setup_logger
 
 log = setup_logger()
 
+
 class BaseQuantLinear(nn.Module):
     SUPPORTS_BITS: List[int] = None
     SUPPORTS_GROUP_SIZE: List[int] = None
@@ -53,26 +54,28 @@ class BaseQuantLinear(nn.Module):
 
     SUPPORTS_DTYPES: List[t.dtype] = None
 
-    def __init__(self,
-                 bits: int,
-                 group_size: int,
-                 desc_act: bool,
-                 sym: bool,
-                 in_features: int,
-                 out_features: int,
-                 bias: bool,
-                 pack_dtype: t.dtype,
-                 backend: BACKEND,
-                 adapter: Adapter,
-                 name: str = None,
-                 register_buffers: bool = False,
-                 register_buffers_in_features: int = None,
-                 register_buffers_out_features: int = None,
-                 **kwargs):
+    def __init__(
+        self,
+        bits: int,
+        group_size: int,
+        desc_act: bool,
+        sym: bool,
+        in_features: int,
+        out_features: int,
+        bias: bool,
+        pack_dtype: t.dtype,
+        backend: BACKEND,
+        adapter: Adapter,
+        name: str = None,
+        register_buffers: bool = False,
+        register_buffers_in_features: int = None,
+        register_buffers_out_features: int = None,
+        **kwargs,
+    ):
         super().__init__()
         if name is None:
             name = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-        self.name = name # full path module name in model weights
+        self.name = name  # full path module name in model weights
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size if group_size != -1 else in_features
@@ -80,18 +83,18 @@ class BaseQuantLinear(nn.Module):
         self.desc_act = desc_act
         self.pack_dtype = pack_dtype
         self.backend = backend
-        self.maxq = 2 ** self.bits - 1
+        self.maxq = 2**self.bits - 1
         self.pack_dtype = pack_dtype
         # we need to clone the adapter since passed in adapter may be shared
         # adapter tensors are lodaed inside adapter so they must be unique per module
-        self.adapter =  copy.deepcopy(adapter)
+        self.adapter = copy.deepcopy(adapter)
 
         self.optimized = False
 
         if self.pack_dtype == t.int8:
             self.pack_dtype_bits = 8
-            self.pack_np_dtype = np.int8 # qweight saved dtype
-            self.pack_np_math_dtype = np.uint8 # pre-save math dtype
+            self.pack_np_dtype = np.int8  # qweight saved dtype
+            self.pack_np_math_dtype = np.uint8  # pre-save math dtype
         elif self.pack_dtype == t.int16:
             self.pack_dtype_bits = 16
             self.pack_np_dtype = np.int16
@@ -105,26 +108,47 @@ class BaseQuantLinear(nn.Module):
             self.pack_np_dtype = np.int64
             self.pack_np_math_dtype = np.uint64
         else:
-            raise ValueError("Unsupported weight_dtype. Only int16 and int32 are supported.")
+            raise ValueError(
+                "Unsupported weight_dtype. Only int16 and int32 are supported."
+            )
 
         # pack_factor is only used for bits 2, 4, and 8. bit3 3 does not use this variable.
         self.pack_factor = self.pack_dtype_bits // self.bits
-        _, err = self._validate(bits=bits, group_size=group_size, desc_act=desc_act, sym=sym, in_features=in_features, out_features=out_features, pack_dtype=pack_dtype)
+        _, err = self._validate(
+            bits=bits,
+            group_size=group_size,
+            desc_act=desc_act,
+            sym=sym,
+            in_features=in_features,
+            out_features=out_features,
+            pack_dtype=pack_dtype,
+        )
         if err:
             raise err
 
         # store qzero format
-        self._qzeros_format = 1 # only valid values are 1 and 2 for GPTQ v1 GPTQ v2
+        self._qzeros_format = 1  # only valid values are 1 and 2 for GPTQ v1 GPTQ v2
 
         # most kernels share same buffers so they can share same register buffer code
         if register_buffers:
             # some kernels auto-pads in/out features
-            in_features = self.in_features if not register_buffers_in_features else register_buffers_in_features
-            out_features = self.out_features if not register_buffers_out_features else register_buffers_out_features
+            in_features = (
+                self.in_features
+                if not register_buffers_in_features
+                else register_buffers_in_features
+            )
+            out_features = (
+                self.out_features
+                if not register_buffers_out_features
+                else register_buffers_out_features
+            )
 
             self.register_buffer(
                 "qweight",
-                t.zeros((in_features // self.pack_dtype_bits * self.bits, out_features), dtype=self.pack_dtype),
+                t.zeros(
+                    (in_features // self.pack_dtype_bits * self.bits, out_features),
+                    dtype=self.pack_dtype,
+                ),
             )
             self.register_buffer(
                 "qzeros",
@@ -145,7 +169,9 @@ class BaseQuantLinear(nn.Module):
             )
             self.register_buffer(
                 "g_idx",
-                t.tensor([i // self.group_size for i in range(in_features)], dtype=t.int32),
+                t.tensor(
+                    [i // self.group_size for i in range(in_features)], dtype=t.int32
+                ),
             )
             if bias:
                 self.register_buffer("bias", t.zeros(out_features, dtype=t.float16))
@@ -155,7 +181,9 @@ class BaseQuantLinear(nn.Module):
         # load adapter if any
         if adapter is not None:
             if adapter.path in LORA_MERGED_WEIGHT_PATHS:
-                print(f"Adapter (merged weights) lazy init: {self.adapter.name()}: {self.adapter}, module: {self.name}")
+                print(
+                    f"Adapter (merged weights) lazy init: {self.adapter.name()}: {self.adapter}, module: {self.name}"
+                )
 
                 # pre allocate buffers so accelerate can auto-bind merged weights in same tensor file as model
                 self.register_buffer(
@@ -218,28 +246,38 @@ class BaseQuantLinear(nn.Module):
                 weight_key=self.name,
                 device=self.list_buffers()[0].device,
                 lora_A=getattr(self, "lora_A", None),
-                lora_B=getattr(self, "lora_B", None))
+                lora_B=getattr(self, "lora_B", None),
+            )
 
     @classmethod
     # custom quant linear class can override this and add custom checks
     def validate(
-            cls,
-            bits: int,
-            group_size: int,
-            desc_act: bool,
-            sym: bool,
-            in_features:int=None,
-            out_features:int=None,
-            pack_dtype:t.dtype=None,
-            dynamic:Optional[dict]=None,
-            device:Optional[DEVICE]=None,
-            trainable:Optional[bool]=None,
-            adapter:Optional[Adapter]=None,
-    ) -> Tuple[
-        bool, Optional[Exception]]:
-        return cls._validate(bits=bits, group_size=group_size, desc_act=desc_act, sym=sym,
-                             in_features=in_features, out_features=out_features, pack_dtype=pack_dtype,
-                             dynamic=dynamic, device=device, trainable=trainable, adapter=adapter)
+        cls,
+        bits: int,
+        group_size: int,
+        desc_act: bool,
+        sym: bool,
+        in_features: int = None,
+        out_features: int = None,
+        pack_dtype: t.dtype = None,
+        dynamic: Optional[dict] = None,
+        device: Optional[DEVICE] = None,
+        trainable: Optional[bool] = None,
+        adapter: Optional[Adapter] = None,
+    ) -> Tuple[bool, Optional[Exception]]:
+        return cls._validate(
+            bits=bits,
+            group_size=group_size,
+            desc_act=desc_act,
+            sym=sym,
+            in_features=in_features,
+            out_features=out_features,
+            pack_dtype=pack_dtype,
+            dynamic=dynamic,
+            device=device,
+            trainable=trainable,
+            adapter=adapter,
+        )
 
     @classmethod
     # internal method and should not be overriden
@@ -248,11 +286,13 @@ class BaseQuantLinear(nn.Module):
         Validate that SUPPORTS parameters are not None or empty lists, raising an exception if the validation fails.
         """
         base_supports_variables = [
-            (name, value) for name, value in BaseQuantLinear.__dict__.items()
+            (name, value)
+            for name, value in BaseQuantLinear.__dict__.items()
             if name.startswith("SUPPORTS") and not callable(value) and value is None
         ]
         child_supports_variables = [
-            (name, value) for name, value in cls.__dict__.items()
+            (name, value)
+            for name, value in cls.__dict__.items()
             if name.startswith("SUPPORTS") and not callable(value)
         ]
 
@@ -266,7 +306,8 @@ class BaseQuantLinear(nn.Module):
 
         if missing_variables:
             raise ValueError(
-                f"{cls.__name__} these SUPPORTS variables are not overridden: {', '.join(sorted(missing_variables))}")
+                f"{cls.__name__} these SUPPORTS variables are not overridden: {', '.join(sorted(missing_variables))}"
+            )
 
         for name, value in child_supports_variables:
             if not name.startswith("SUPPORTS") or callable(value):
@@ -278,8 +319,20 @@ class BaseQuantLinear(nn.Module):
             #     raise ValueError(f"{cls.__name__}.{name} cannot be an empty list.")
 
     @classmethod
-    def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dynamic:Optional[dict]=None, in_features:int=None,
-                  out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
+    def _validate(
+        cls,
+        bits: int = 4,
+        group_size: int = 128,
+        desc_act: bool = False,
+        sym: bool = False,
+        pack_dtype: t.dtype = None,
+        dynamic: Optional[dict] = None,
+        in_features: int = None,
+        out_features: int = None,
+        device: Optional[DEVICE] = None,
+        trainable: Optional[bool] = None,
+        adapter: Optional[Adapter] = None,
+    ) -> Tuple[bool, Optional[Exception]]:
         cls.verify_supports_params()
 
         if adapter is not None and adapter.__class__ not in cls.SUPPORTS_ADAPTERS:
@@ -290,7 +343,10 @@ class BaseQuantLinear(nn.Module):
             err = f"{cls} does not support `pack_dtype`: {pack_dtype}"
             return False, NotImplementedError(err)
 
-        if PLATFORM.ALL not in cls.SUPPORTS_PLATFORM and sys.platform not in cls.SUPPORTS_PLATFORM:
+        if (
+            PLATFORM.ALL not in cls.SUPPORTS_PLATFORM
+            and sys.platform not in cls.SUPPORTS_PLATFORM
+        ):
             err = f"{cls} does not support platform: {sys.platform}"
             return False, NotImplementedError(err)
 
@@ -356,7 +412,10 @@ class BaseQuantLinear(nn.Module):
                     return False, NotImplementedError(err)
 
         if in_features is not None:
-            validate = all(in_features % in_fea == 0 for in_fea in cls.SUPPORTS_IN_FEATURES_DIVISIBLE_BY)
+            validate = all(
+                in_features % in_fea == 0
+                for in_fea in cls.SUPPORTS_IN_FEATURES_DIVISIBLE_BY
+            )
             if not validate:
                 err = f"{cls}: `in_features`: {in_features} must be divisible by {cls.SUPPORTS_IN_FEATURES_DIVISIBLE_BY}."
                 return False, NotImplementedError(err)
@@ -366,7 +425,10 @@ class BaseQuantLinear(nn.Module):
                 err = f"{cls}: `in_features`: {in_features} must be divisible by `group_size: {group_size}`."
                 return False, NotImplementedError(err)
         if out_features is not None:
-            validate = all(out_features % out_fea == 0 for out_fea in cls.SUPPORTS_OUT_FEATURES_DIVISIBLE_BY)
+            validate = all(
+                out_features % out_fea == 0
+                for out_fea in cls.SUPPORTS_OUT_FEATURES_DIVISIBLE_BY
+            )
             if not validate:
                 err = f"{cls}: `out_features`: {out_features} must be divisible by {cls.SUPPORTS_OUT_FEATURES_DIVISIBLE_BY}."
                 return False, NotImplementedError(err)
@@ -377,11 +439,15 @@ class BaseQuantLinear(nn.Module):
         assert isinstance(device, DEVICE)
 
         if device not in cls.SUPPORTS_DEVICES:
-            raise NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_DEVICES}`: actual device = `{device}`")
+            raise NotImplementedError(
+                f"{cls} only supports `{cls.SUPPORTS_DEVICES}`: actual device = `{device}`"
+            )
 
     # use optimize so we don't override native module.compile()
     # override me, to perform any torch.compile logic on the kernel pre forward
-    def optimize(self, backend: str = "inductor", mode: str = None, fullgraph: bool = False):
+    def optimize(
+        self, backend: str = "inductor", mode: str = None, fullgraph: bool = False
+    ):
         self.optimized = True
         log.info.once(f"Optimize: `{self.__class__.__name__}` compilation triggered.")
         pass
@@ -408,20 +474,28 @@ class BaseQuantLinear(nn.Module):
 
         return super().train(mode)
 
+
 class PackableQuantLinear(BaseQuantLinear):
     def post_init(self, **kwargs):
         if self.bits in [2, 4, 8]:
-            wf = t.tensor(list(range(0, self.pack_dtype_bits, self.bits)), dtype=t.int32).unsqueeze(0).to(
-                device=self.g_idx.device)
+            wf = (
+                t.tensor(list(range(0, self.pack_dtype_bits, self.bits)), dtype=t.int32)
+                .unsqueeze(0)
+                .to(device=self.g_idx.device)
+            )
         elif self.bits == 3:
-            wf = t.tensor(
-                [
-                    [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 0],
-                    [0, 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31],
-                    [0, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 0],
-                ],
-                dtype=t.int32,
-            ).reshape(1, 3, 12).to(device=self.g_idx.device)
+            wf = (
+                t.tensor(
+                    [
+                        [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 0],
+                        [0, 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31],
+                        [0, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 0],
+                    ],
+                    dtype=t.int32,
+                )
+                .reshape(1, 3, 12)
+                .to(device=self.g_idx.device)
+            )
 
         # self.register_buffer("wf_unsqueeze_zero", wf.unsqueeze(0).to(device=self.g_idx.device))
         # self.register_buffer("wf_unsqueeze_neg_one", wf.unsqueeze(-1).to(device=self.g_idx.device))
@@ -441,56 +515,72 @@ class PackableQuantLinear(BaseQuantLinear):
         if self.bits in [2, 4, 8]:
             zeros = t.bitwise_right_shift(
                 t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
-                self.wf_unsqueeze_zero  # self.wf.unsqueeze(0),
+                self.wf_unsqueeze_zero,  # self.wf.unsqueeze(0),
             ).to(self.dequant_dtype)
             zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
 
             weight = t.bitwise_and(
                 t.bitwise_right_shift(
                     t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1),
-                    self.wf_unsqueeze_neg_one  # self.wf.unsqueeze(-1)
+                    self.wf_unsqueeze_neg_one,  # self.wf.unsqueeze(-1)
                 ).to(self.dequant_dtype),
-                self.maxq
+                self.maxq,
             )
         elif self.bits == 3:
-            zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(
-                -1, -1, -1, 12
-            )
+            zeros = self.qzeros.reshape(
+                self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1
+            ).expand(-1, -1, -1, 12)
             zeros = zeros >> self.wf_unsqueeze_zero  # self.wf.unsqueeze(0)
-            zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
-            zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
+            zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | (
+                (zeros[:, :, 1, 0] << 2) & 0x4
+            )
+            zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | (
+                (zeros[:, :, 2, 0] << 1) & 0x6
+            )
             zeros = zeros & 0x7
             zeros = t.cat(
                 [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
                 dim=2,
             ).reshape(self.scales.shape)
 
-            weight = self.qweight.reshape(self.qweight.shape[0] // 3, 3, 1, self.qweight.shape[1]).expand(
-                -1, -1, 12, -1
-            )
-            weight = (weight >> self.wf_unsqueeze_neg_one) & 0x7  # self.wf.unsqueeze(-1)
+            weight = self.qweight.reshape(
+                self.qweight.shape[0] // 3, 3, 1, self.qweight.shape[1]
+            ).expand(-1, -1, 12, -1)
+            weight = (
+                weight >> self.wf_unsqueeze_neg_one
+            ) & 0x7  # self.wf.unsqueeze(-1)
             weight[:, 0, 10] = (weight[:, 0, 10] & 0x3) | ((weight[:, 1, 0] << 2) & 0x4)
             weight[:, 1, 11] = (weight[:, 1, 11] & 0x1) | ((weight[:, 2, 0] << 1) & 0x6)
             weight = weight & 0x7
-            weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
+            weight = t.cat(
+                [weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1
+            )
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
         if num_itr == 1:
-            weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
+            weights = self.scales[self.g_idx.long()] * (
+                weight - zeros[self.g_idx.long()]
+            )
         else:
             num_dim = self.g_idx.shape[0] // num_itr
             weights = []
             for i in range(num_itr):
-                scale_i = self.scales[:, i * num_dim: (i + 1) * num_dim]
-                weight_i = weight[:, i * num_dim: (i + 1) * num_dim]
-                zeros_i = zeros[:, i * num_dim: (i + 1) * num_dim]
-                g_idx_i = self.g_idx[i * num_dim: (i + 1) * num_dim].long()
+                scale_i = self.scales[:, i * num_dim : (i + 1) * num_dim]
+                weight_i = weight[:, i * num_dim : (i + 1) * num_dim]
+                zeros_i = zeros[:, i * num_dim : (i + 1) * num_dim]
+                g_idx_i = self.g_idx[i * num_dim : (i + 1) * num_dim].long()
                 weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
             weights = t.cat(weights, dim=1)
 
         return weights
 
-    def pack(self, linear: nn.Module, scales: t.Tensor, zeros: t.Tensor, g_idx: t.Tensor=None):
+    def pack(
+        self,
+        linear: nn.Module,
+        scales: t.Tensor,
+        zeros: t.Tensor,
+        g_idx: t.Tensor = None,
+    ):
         W = linear.weight.data.clone()
         if isinstance(linear, _ConvNd):
             W = W.flatten(1)
@@ -506,16 +596,25 @@ class PackableQuantLinear(BaseQuantLinear):
         if linear.bias is not None:
             self.bias = linear.bias.clone().to(dtype=t.float16)
 
-        int_weight = t.round((W + scale_zeros[self.g_idx].T) / scales[self.g_idx].T).to(t.int32)
+        int_weight = t.round((W + scale_zeros[self.g_idx].T) / scales[self.g_idx].T).to(
+            t.int32
+        )
         int_weight = int_weight.T.contiguous()
         int_weight = int_weight.numpy().astype(self.pack_np_math_dtype)
 
-        qweight = np.zeros((int_weight.shape[0] // self.pack_dtype_bits * self.bits, int_weight.shape[1]),
-                           dtype=self.pack_np_math_dtype)
+        qweight = np.zeros(
+            (
+                int_weight.shape[0] // self.pack_dtype_bits * self.bits,
+                int_weight.shape[1],
+            ),
+            dtype=self.pack_np_math_dtype,
+        )
         if self.bits in [2, 4, 8]:
             for row in range(qweight.shape[0]):
                 for j in range(self.pack_factor):
-                    qweight[row] |= int_weight[row * self.pack_factor + j] << (self.bits * j)
+                    qweight[row] |= int_weight[row * self.pack_factor + j] << (
+                        self.bits * j
+                    )
         elif self.bits == 3:
             i = 0
             row = 0
@@ -542,11 +641,16 @@ class PackableQuantLinear(BaseQuantLinear):
         self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
 
         zeros = zeros.numpy().astype(self.pack_np_math_dtype)
-        qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // self.pack_dtype_bits * self.bits), dtype=self.pack_np_math_dtype)
+        qzeros = np.zeros(
+            (zeros.shape[0], zeros.shape[1] // self.pack_dtype_bits * self.bits),
+            dtype=self.pack_np_math_dtype,
+        )
         if self.bits in [2, 4, 8]:
             for col in range(qzeros.shape[1]):
                 for j in range(self.pack_factor):
-                    qzeros[:, col] |= zeros[:, col * self.pack_factor + j] << (self.bits * j)
+                    qzeros[:, col] |= zeros[:, col * self.pack_factor + j] << (
+                        self.bits * j
+                    )
         elif self.bits == 3:
             i = 0
             col = 0
@@ -583,3 +687,79 @@ class PackableQuantLinear(BaseQuantLinear):
         # assert t.equal(wq, wq_dequantized)
 
         # print("self qw", self.qweight, self.scales, self.qzeros)
+
+    def unpack_qweight(self) -> t.Tensor:
+        """
+        Unpacks the quantized weight tensor (qweight) into a tensor of integers.
+        The unpacked tensor will have the shape (in_features, out_features).
+        """
+        if self.bits not in [2, 4, 8]:
+            raise NotImplementedError(
+                f"Unpacking for {self.bits}-bit weights is not implemented."
+            )
+
+        # Create a bitmask for extracting the packed values
+        mask = (1 << self.bits) - 1
+
+        # Prepare for unpacking
+        unpacked_weight = t.zeros(
+            (self.qweight.shape[0] * self.pack_factor, self.qweight.shape[1]),
+            dtype=t.int32,
+            device=self.qweight.device,
+        )
+
+        # Unpack the weights
+        for j in range(self.pack_factor):
+            shift = self.bits * j
+            unpacked_weight[j :: self.pack_factor, :] = (self.qweight >> shift) & mask
+
+        return unpacked_weight
+
+    
+    def quantize_to_int(self, x: t.Tensor) -> t.Tensor:
+        """
+        Quantizes a floating-point tensor and packs it back into self.qweight,
+        using the layer's existing scales and zero-points. This mimics the packing logic.
+
+        Args:
+            x (torch.Tensor): The input tensor with the same shape as the original weights.
+
+        Returns:
+            torch.Tensor: The tensor with quantized integer values (before packing).
+        """
+        if self.desc_act:
+            raise NotImplementedError(
+                "quantize_to_int is only implemented for asymmetric quantization."
+            )
+
+        # 1. Unpack qzeros to get the true integer zero-points
+        if self.bits in [2, 4, 8]:
+            zeros = t.zeros(self.scales.shape, dtype=t.int32, device=self.qzeros.device)
+            for i in range(self.qzeros.shape[1]):
+                col = self.qzeros[:, i]
+                for j in range(self.pack_factor):
+                    shift = self.bits * j
+                    start_idx = i * self.pack_factor
+                    if start_idx + j < self.scales.shape[1]:
+                        zeros[:, start_idx + j] = (col >> shift) & ((1 << self.bits) - 1)
+        else:
+            raise NotImplementedError("Unpacking non 2, 4, or 8-bit qzeros is not yet implemented.")
+
+        # 2. Quantize the input tensor to integers
+        # Formula: q = round(x / scale) + zero
+
+        scales_expanded = self.scales.repeat_interleave(self.group_size, dim=0)  # (in_features, out_features)
+        zeros_expanded = zeros.repeat_interleave(self.group_size, dim=0)         # (in_features, out_features)
+        scale_zeros_expanded = zeros_expanded * scales_expanded
+    
+        # Apply the same formula as the pack function
+        q = t.clamp(t.round((x + scale_zeros_expanded) / scales_expanded), 0, self.maxq).to(t.int32)
+
+        # 3. Pack the integer tensor `q` back into self.qweight
+        self.qweight.zero_() # Clear the existing qweight
+        for i in range(q.shape[0]):
+            row = i // self.pack_factor
+            col = i % self.pack_factor
+            self.qweight[row] |= q[i].to(self.qweight.dtype) << (self.bits * col)
+
+        return q
