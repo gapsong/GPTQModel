@@ -756,10 +756,40 @@ class PackableQuantLinear(BaseQuantLinear):
         q = t.clamp(t.round((x + scale_zeros_expanded) / scales_expanded), 0, self.maxq).to(t.int32)
 
         # 3. Pack the integer tensor `q` back into self.qweight
+        # temp = self.qweight.clone()
         self.qweight.zero_() # Clear the existing qweight
         for i in range(q.shape[0]):
             row = i // self.pack_factor
             col = i % self.pack_factor
             self.qweight[row] |= q[i].to(self.qweight.dtype) << (self.bits * col)
 
+        # self.compare_qweights_properly(temp, self.qweight)
+        
         return q
+    
+        
+    def compare_qweights_properly(self, original_qweight, new_qweight):
+        """Proper comparison of qweight tensors"""
+        if original_qweight.shape != new_qweight.shape:
+            print(f"Shape mismatch: {original_qweight.shape} vs {new_qweight.shape}")
+            return False
+        
+        equal_mask = (original_qweight == new_qweight)
+        total_elements = original_qweight.numel()
+        matching_elements = t.sum(equal_mask).item()
+        
+        print(f"Total elements: {total_elements}")
+        print(f"Matching elements: {matching_elements}")
+        print(f"Match percentage: {100 * matching_elements / total_elements:.2f}%")
+        
+        if matching_elements != total_elements:
+            # Find first difference
+            diff_indices = t.where(~equal_mask)
+            if len(diff_indices[0]) > 0:
+                first_diff_row = diff_indices[0][0].item()
+                first_diff_col = diff_indices[1][0].item()
+                print(f"First difference at [{first_diff_row}, {first_diff_col}]:")
+                print(f"  Original: {original_qweight[first_diff_row, first_diff_col]}")
+                print(f"  New: {new_qweight[first_diff_row, first_diff_col]}")
+        
+        return matching_elements == total_elements
