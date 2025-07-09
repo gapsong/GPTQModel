@@ -766,8 +766,77 @@ class PackableQuantLinear(BaseQuantLinear):
         # self.compare_qweights_properly(temp, self.qweight)
         
         return q
-    
-        
+
+
+    def replace_random_groups_with_packed_structure(self, replacement_prob: float = 0.1):
+        """
+        Randomly selects groups and directly overwrites their packed qweight representation
+        with a hardcoded, pre-packed structure.
+
+        This method is highly efficient as it avoids dequantization and operates
+        directly on the packed `qweight` tensor.
+
+        Args:
+            replacement_prob (float): The probability of replacing any given group.
+        """
+        if not hasattr(self, 'group_size') or self.group_size is None:
+            print("Error: `group_size` is not defined for this layer.")
+            return
+        if self.bits not in [2, 4, 8]:
+            raise NotImplementedError(f"Direct packed replacement is not implemented for {self.bits}-bit weights.")
+
+        # 1. Randomly select groups to replace.
+        num_groups = self.in_features // self.group_size
+        rng = np.random.default_rng(seed=42) # Use a seeded generator for reproducibility
+        groups_to_replace = np.where(rng.random(num_groups) < replacement_prob)[0].tolist()
+
+        if not groups_to_replace:
+            print(f"No groups were randomly selected for replacement (prob={replacement_prob}).")
+            return
+
+        print(f"--- Directly replacing {len(groups_to_replace)}/{num_groups} groups in packed qweight ---")
+        print(f"Selected groups: {groups_to_replace}")
+
+        # 2. Create the PACKED replacement block ONCE.
+        # This block will have the shape (group_size / pack_factor, 1)
+        # and will be broadcast across all output features.
+
+        # First, define the unpacked 1D integer pattern.
+        base_pattern = t.arange(16, device=self.qweight.device, dtype=t.int32)
+        num_repeats = (self.group_size + 15) // 16
+        structure_pattern_1d = base_pattern.repeat(num_repeats)[:self.group_size]
+
+        # Now, pack this 1D pattern into a column vector.
+        packed_rows = self.group_size // self.pack_factor
+        packed_replacement_block = t.zeros(packed_rows, 1, dtype=self.qweight.dtype, device=self.qweight.device)
+
+        for i in range(packed_rows):
+            packed_value = 0
+            for j in range(self.pack_factor):
+                # Get the integer value from our repeating pattern
+                unpacked_value = structure_pattern_1d[i * self.pack_factor + j]
+                # Pack it into the correct bit position
+                packed_value |= unpacked_value.to(t.int32) << (self.bits * j)
+            
+            packed_replacement_block[i, 0] = packed_value
+
+        print(f"Created packed replacement block of shape: {packed_replacement_block.shape}")
+
+        # 3. Overwrite the corresponding rows in self.qweight for each selected group.
+        with t.no_grad():
+            for group_idx in groups_to_replace:
+                # Calculate the start and end row in the PACKED qweight tensor
+                start_packed_row = group_idx * (self.group_size // self.pack_factor)
+                end_packed_row = start_packed_row + (self.group_size // self.pack_factor)
+
+                print(f"Overwriting packed rows {start_packed_row} to {end_packed_row} for group {group_idx}.")
+                
+                # Broadcasting automatically handles the columns
+                self.qweight[start_packed_row:end_packed_row, :] = packed_replacement_block
+
+        print("--- Direct packed replacement complete. ---")
+
+            
     def compare_qweights_properly(self, original_qweight, new_qweight):
         """Proper comparison of qweight tensors"""
         if original_qweight.shape != new_qweight.shape:
