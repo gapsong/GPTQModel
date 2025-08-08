@@ -768,7 +768,7 @@ class PackableQuantLinear(BaseQuantLinear):
         return q
 
 
-    def replace_random_groups_with_packed_structure(self, replacement_prob: float = 0.1):
+    def replace_random_groups_with_packed_structure(self, replacement_prob: float = 0.1, seed: int = 42):
         """
         Randomly selects groups and directly overwrites their packed qweight representation
         with a hardcoded, pre-packed structure.
@@ -787,7 +787,7 @@ class PackableQuantLinear(BaseQuantLinear):
 
         # 1. Randomly select groups to replace.
         num_groups = self.in_features // self.group_size
-        rng = np.random.default_rng(seed=42) # Use a seeded generator for reproducibility
+        rng = np.random.default_rng(seed=seed) # Use a seeded generator for reproducibility
         groups_to_replace = np.where(rng.random(num_groups) < replacement_prob)[0].tolist()
 
         if not groups_to_replace:
@@ -804,8 +804,8 @@ class PackableQuantLinear(BaseQuantLinear):
         # First, define the unpacked 1D integer pattern.
         base_pattern = t.arange(16, device=self.qweight.device, dtype=t.int32)
         num_repeats = (self.group_size + 15) // 16
-        structure_pattern_1d = base_pattern.repeat(num_repeats)[:self.group_size]
-
+        # structure_pattern_1d = base_pattern.repeat(num_repeats)[:self.group_size]
+        structure_pattern_1d = t.tensor([0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 11, 11, 12, 12, 13, 14, 15, 15])
         # Now, pack this 1D pattern into a column vector.
         packed_rows = self.group_size // self.pack_factor
         packed_replacement_block = t.zeros(packed_rows, 1, dtype=self.qweight.dtype, device=self.qweight.device)
@@ -862,3 +862,76 @@ class PackableQuantLinear(BaseQuantLinear):
                 print(f"  New: {new_qweight[first_diff_row, first_diff_col]}")
         
         return matching_elements == total_elements
+    
+    def analyze_id_histogram_per_position(self, name="ID Histogram per Position"):
+        print("ID histogram per position in the groups")
+        print("qweight shape", self.qweight.shape)
+        # unpack the qweight
+        unpacked_weight = self.unpack_qweight()
+        print("unpacked weight shape", unpacked_weight.shape)
+        group_size = self.group_size
+        num_groups = unpacked_weight.shape[0] // group_size
+        print(f"Number of groups: {num_groups}")
+
+        # Reshape to (num_groups, group_size, out_features)
+        reshaped_weight = unpacked_weight.view(num_groups, group_size, -1).int()
+        print("reshaped weight shape", reshaped_weight.shape)
+        # [num_groups, group_size, out_features]
+
+        max_id = int(reshaped_weight.max().item())
+        min_id = int(reshaped_weight.min().item())
+        print(f"IDs range from {min_id} to {max_id}")
+
+        # Count appearances of each ID per position (over all groups and out_features)
+        # Result: [group_size, num_ids]
+        id_hist_per_position = []
+        for pos in range(group_size):
+            ids_at_pos = reshaped_weight[:, pos, :].flatten()
+            hist = t.bincount(ids_at_pos, minlength=max_id+1)
+            id_hist_per_position.append(hist)
+            print(f"Position {pos:2d}: {hist.cpu().numpy().tolist()}")
+
+        id_hist_per_position = t.stack(id_hist_per_position)  # [group_size, num_ids]
+
+        # Optional: Plot as heatmap
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            plt.figure(figsize=(12, 6))
+            sns.heatmap(id_hist_per_position.cpu().numpy().T, cmap="viridis", cbar_kws={'label': 'Count'})
+            plt.title(f"ID Histogram per Position for Layer: {name}")
+            plt.xlabel("Position in Group")
+            plt.ylabel("ID")
+            plt.show()
+            plt.savefig(f"./histograms/{name}_id_histogram_per_position.png")
+        except ImportError:
+            print("Info: matplotlib/seaborn not installed. Plot will be skipped.")
+        
+    # def analyze_id_distribution(self):
+    #     """
+    #     Analysiert und visualisiert die tatsächliche Verteilung der quantisierten
+    #     Gewichts-IDs (0-15) in diesem Layer.
+    #     """
+    #     print("\n--- Analyse der ID-Verteilung ---")
+    #     unpacked_ids = self.unpack_qweight()
+        
+    #     # Zähle die Häufigkeit jeder ID
+    #     # bincount ist extrem effizient für diese Aufgabe
+    #     id_counts = t.bincount(unpacked_ids.flatten(), minlength=self.maxq + 1)
+        
+    #     print("Häufigkeit jeder ID (0-15):")
+    #     for i, count in enumerate(id_counts):
+    #         print(f"  ID {i:2d}: {count.item():>8d} Vorkommen")
+            
+    #     # Optional: Plotten für eine visuelle Darstellung
+    #     try:
+    #         import matplotlib.pyplot as plt
+    #         import seaborn as sns
+    #         plt.figure(figsize=(10, 6))
+    #         sns.barplot(x=t.arange(len(id_counts)).cpu(), y=id_counts.cpu())
+    #         plt.title(f"Tatsächliche ID-Verteilung für Layer: {self.name}")
+    #         plt.xlabel("ID")
+    #         plt.ylabel("Häufigkeit")
+    #         plt.show()
+    #     except ImportError:
+    #         print("Info: matplotlib/seaborn nicht installiert. Plot wird übersprungen.")
