@@ -30,7 +30,7 @@ from ..looper.named_module import NamedModule
 from ..looper.native_processor import NativeProcessor
 from ..models import BaseGPTQModel
 from ..models._const import SUPPORTS_MODULE_TYPES
-from ..nn_modules.hooked_linear import replace_module_with_hooked_legacy, replace_module_with_hooked_tree
+from ..nn_modules.hooked_linear import replace_module_with_hooked_legacy, replace_module_with_hooked_tree, HookedLinear
 from ..utils.logger import setup_logger
 from ..utils.model import (find_modules, get_device, get_module, get_module_by_name_prefix,
                            get_moe_layer_modules, move_to, nested_move_to)
@@ -47,7 +47,7 @@ class ModuleLooper():
         self.support_batch_quantize = model.support_batch_quantize
         self.lock = threading.Lock()
 
-    def cache_inputs(self, layers, auto_gc, calibration_data, calibration_enable_gpu_cache):
+    def cache_inputs(self, layers, auto_gc, calibration_data, calibration_enable_gpu_cache, use_cache):
         layer_inputs = []
         attention_masks = []
         position_ids = []
@@ -60,14 +60,13 @@ class ModuleLooper():
         def store_input_hook(module, args, kwargs):
             # Positional arguments.
             layer_input = []
-            for inp in args:
-                layer_input.append(move_to(inp, device=data_device))
-            if len(layer_input) == 0:
-                # Some models put hidden_states in kwargs instead of args.
-                # For example, gptj ...
-                if kwargs.get("hidden_states") is not None:
-                    layer_input.append(move_to(kwargs["hidden_states"], device=data_device))
-
+            if kwargs.get("hidden_states") is not None:
+                layer_input.append(move_to(kwargs["hidden_states"], device=data_device))
+            else:
+                # If hidden_states is not in kwargs, get it from the first positional argument
+                # If error occurs here, check the model's modeling code
+                layer_input.append(move_to(args[0], device=data_device))
+                
             layer_inputs.append(layer_input)
 
             # Keyword arguments.
@@ -123,7 +122,7 @@ class ModuleLooper():
                 if str(type(layers[0])) == "<class 'transformers.models.qwen2_5_omni.modeling_qwen2_5_omni.Qwen2_5OmniDecoderLayer'>":
                     self.gptq_model.model.generate(**example, return_audio=False)
                 else:
-                    self.gptq_model.model(**example)
+                    self.gptq_model.model(**example, use_cache=use_cache)
             except ValueError:
                 pass
         self.gptq_model.pre_quantize_generate_hook_end()
@@ -182,7 +181,8 @@ class ModuleLooper():
 
             input_cache = self.cache_inputs(layers=layers, auto_gc=auto_gc,
                                             calibration_data=processor.calibration_dataset,
-                                            calibration_enable_gpu_cache=calibration_enable_gpu_cache)
+                                            calibration_enable_gpu_cache=calibration_enable_gpu_cache,
+                                            use_cache=False)
             processor.receive_input_cache(input_cache)
 
         # release calibration_dataset
@@ -217,13 +217,23 @@ class ModuleLooper():
         else:
             replace_module_with_hooked_legacy(self.gptq_model.model)
 
+        if self.gptq_model.quantize_config.lm_head:
+            lm_head_module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
+            if lm_head_module and isinstance(lm_head_module, torch.nn.Linear):
+                hooked_lm_head = HookedLinear.from_linear(lm_head_module)
+                module_path = self.gptq_model.lm_head.split('.')
+                parent = self.gptq_model.model
+                for part in module_path[:-1]:
+                    parent = getattr(parent, part)
+                setattr(parent, module_path[-1], hooked_lm_head)
+
+
         for layer_index in quant_modules_pb:
             is_lm_head_module = layer_index >= layer_count
 
             if is_lm_head_module:
                 quant_modules_pb.title("Quantizing lm_head").draw()
                 module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
-                layer_inputs = self.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
             else:
                 quant_modules_pb.title(f"Quantizing layer {layer_index} of {layer_count - 1}").draw()
                 module = layers[layer_index]
@@ -242,6 +252,8 @@ class ModuleLooper():
                 processor.collect_memory_info(layer_index)
 
                 layer_inputs = processor.inputs_cache.layer_inputs
+                if is_lm_head_module:
+                    layer_inputs = self.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
                 layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
                 position_ids = processor.inputs_cache.position_ids
                 attention_masks = processor.inputs_cache.attention_masks
@@ -352,7 +364,12 @@ class ModuleLooper():
                         # For Native processor, we can update processor input here
                         # if second forward is not required, this/first forward output is captured as input for next loop
                         if not processor.fwd_after_process:
-                            layer_outputs.append([layer_output[0]])
+                            # after transformers 4.54, some model's DecodeLayer.forward() no longer returns tuple
+                            if isinstance(layer_output, tuple):
+                                layer_outputs.append([layer_output[0]])
+                            else:
+                                layer_outputs.append([layer_output])
+
 
                         del layer_input
                         del additional_layer_inputs
@@ -466,13 +483,24 @@ class ModuleLooper():
                                 additional_layer_inputs["kv_last_layer"] = shared_kv_cache_dict.get(layer_index - 1)
 
                         # log.info(f"MODULE Last forward: {module}")
+                        module_output = None
+                        if is_lm_head_module:
+                            module_output = module(*layer_input)
+                        else:
+                            module_output = module(*layer_input, **additional_layer_inputs)
+
+                        # after transformers 4.54, some model's DecodeLayer.forward() no longer returns tuple
+                        if isinstance(module_output, tuple):
+                            layer_output = module_output[0]
+                        else:
+                            layer_output = module_output
+                            
                         layer_output = move_to(
-                            module(*layer_input)[0] if is_lm_head_module else
-                            module(*layer_input, **additional_layer_inputs)[0],
+                            layer_output,
                             device=cur_layer_device if calibration_enable_gpu_cache else CPU,
                             # stream=True,
                         )
-
+                        
                         layer_outputs.append([layer_output])
 
                         del layer_input

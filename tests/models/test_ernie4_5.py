@@ -13,19 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from model_test import ModelTest
 
 
-class TestTeleChat_2(ModelTest):
-    NATIVE_MODEL_ID = "/monster/data/model/TeleChat2-7B/"  # "Tele-AI/TeleChat2-7B"
-    NATIVE_ARC_CHALLENGE_ACC = 0.3677
-    NATIVE_ARC_CHALLENGE_ACC_NORM = 0.3831
-    APPLY_CHAT_TEMPLATE = True
+class TestErnie4_5(ModelTest):
+    NATIVE_MODEL_ID = "/monster/data/model/ERNIE-4.5-0.3B-PT/"
+    NATIVE_ARC_CHALLENGE_ACC = 0.2969
+    NATIVE_ARC_CHALLENGE_ACC_NORM = 0.3183
     TRUST_REMOTE_CODE = True
     EVAL_BATCH_SIZE = 6
-    USE_VLLM = False
     USE_FLASH_ATTN = False
 
-
-    def test_telechat2(self):
+    def test_exaone(self):
         self.quant_lm_eval()
+
+
