@@ -32,15 +32,12 @@ from .deepseek_v2 import DeepSeekV2GPTQ
 from .deepseek_v3 import DeepSeekV3GPTQ
 from .dream import DreamGPTQ
 from .exaone import ExaoneGPTQ
-from .ernie4_5 import ERNIE4_5GPTQ
-from .ernie4_5_moe import ERNIE4_5_MOEGPTQ
 from .gemma import GemmaGPTQ
 from .gemma2 import Gemma2GPTQ
 from .gemma3 import Gemma3GPTQ
 from .glm import GLM
 from .gpt2 import GPT2GPTQ
 from .gpt_bigcode import GPTBigCodeGPTQ
-from .gpt_neo import GPTNeoGPTQ
 from .gpt_neox import GPTNeoXGPTQ
 from .gptj import GPTJGPTQ
 from .granite import GraniteGPTQ
@@ -78,4 +75,3 @@ from .telechat2 import TeleChat2GPTQ
 from .xverse import XverseGPTQ
 from .yi import YiGPTQ
 from .falcon_h1 import FalconH1GPTQ
-from .pangu_alpha import PanguAlphaGPTQ

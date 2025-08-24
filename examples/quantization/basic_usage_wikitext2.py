@@ -33,7 +33,7 @@ def get_wikitext2(tokenizer, nsamples, seqlen):
 
 @torch.no_grad()
 def calculate_avg_ppl(model, tokenizer):
-    from gptqmodel.utils.perplexity import Perplexity
+    from gptqmodel.utils import Perplexity
 
     ppl = Perplexity(
         model=model,

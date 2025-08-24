@@ -22,6 +22,13 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
+qqq_import_exception = None
+try:
+    import gptqmodel_qqq_kernels
+except ImportError as e:
+    qqq_import_exception = e
+
+
 from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
@@ -33,7 +40,7 @@ qqq_import_exception = None
 try:
     import gptqmodel_qqq_kernels
 except ImportError as e:
-    qqq_import_exception = str(e)
+    qqq_import_exception = e
 
 log = setup_logger()
 
@@ -211,7 +218,7 @@ class QQQQuantLinear(BaseQuantLinear):
     @classmethod
     def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
         if qqq_import_exception is not None:
-            return False, ImportError(qqq_import_exception)
+            return False, qqq_import_exception
 
         in_features = args.get("in_features")
         out_features = args.get("out_features")

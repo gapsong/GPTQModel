@@ -17,7 +17,7 @@
 from typing import Dict, Optional
 
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor, ProcessorMixin
+from transformers import AutoModelForVision2Seq, AutoProcessor, ProcessorMixin
 
 from ...utils.calibration import batched
 from ...utils.image import extract_vision_info, fetch_image
@@ -27,7 +27,7 @@ from ..base import BaseGPTQModel
 
 
 class BaseQwen2VLGPTQ(BaseGPTQModel):
-    loader = AutoModelForImageTextToText
+    loader = AutoModelForVision2Seq
 
     base_modules = ["model.embed_tokens", "model.norm"]
     pre_lm_head_norm_module = "model.norm"
