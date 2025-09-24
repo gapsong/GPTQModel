@@ -61,7 +61,7 @@ def get_number_of_rows_and_cols(layer: nn.Module):
 
 
 class GPTQ:
-    def __init__(self, module: nn.Module, qcfg: Optional[QuantizeConfig]=None):
+    def __init__(self, module: nn.Module, lr_layer=None ,qcfg: Optional[QuantizeConfig]=None):
         # self.lock = threading.Lock()
 
         # self.num_tied_handles = 0
@@ -101,6 +101,7 @@ class GPTQ:
 
         # fwd counter
         self.fwd_counter = 0
+        self.lr_layer = lr_layer  # Neuer Parameter: LR-Tensor für diesen Layer
 
     @staticmethod
     def _validate_module(module):
@@ -185,8 +186,8 @@ class GPTQ:
 
         if self.H is None:
             self.H = torch.zeros((self.columns, self.columns),
-                                 dtype=torch.float32,
-                                 device=reshaped_inp.device)
+                                dtype=torch.float32,
+                                device=reshaped_inp.device)
 
         # moe model may receive an empty batch, return early
         if batch_token_size == 0:
@@ -275,7 +276,7 @@ class GPTQ:
         # log.info(f"Quantization `{self.name}` using samples: `{self.nsamples}`")
         start = time.time()
 
-        self.hessian_inverse = torch_compile(self.hessian_inverse)
+        # self.hessian_inverse = torch_compile(self.hessian_inverse)
 
         # process buffered inputs
         if len(self.fwd_inputs_buffered_data) > 0:
