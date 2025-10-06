@@ -5,7 +5,7 @@ requires = [
 build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
-name = "GPT-QModel"
+name = "gptqmodel"
 dynamic = ["version"]
 description = "Production ready LLM model compression/quantization toolkit with hw accelerated inference support for both cpu/gpu via HF, vLLM, and SGLang."
 readme = "README.md"
@@ -34,7 +34,7 @@ dependencies = [
     "numpy==2.2.6",
     "torch>=2.8.0",
     "safetensors>=0.6.2",
-    "transformers>=4.56.0",
+    "transformers==4.51.2",
     "threadpoolctl>=3.6.0",
     "packaging>=24.2",
     "device-smi==0.4.1",
