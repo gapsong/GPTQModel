@@ -139,73 +139,20 @@ class GPTQ:
 
             # print(f"self.module.target_device = {self.module.target_device}")
 
-            self.process_batch(inp)
+            self.process_batch(inp, out)
 
-    def process_batch(self, inp: torch.Tensor):
-        # print(f"inp = {inp}")
-        # print(f"self.module = {self.module} device = {self.module.target_device}")
-        inp_device = get_device(inp)
-        if inp_device.type == "cuda":
-            torch.cuda.set_device(inp_device)
-
-        inp = inp.to(device=self.module.target_device, dtype=torch.float32)
-
-        # input reshaping
-        if isinstance(self.module, (nn.Linear, transformers.Conv1D)):
-            reshaped_inp = inp.reshape(-1, inp.shape[-1])
-        else:
-            if isinstance(self.module, nn.Conv1d):
-                reshaped_inp = inp.reshape(
-                    inp.size(0) * self.module.groups,
-                    inp.size(1) // self.module.groups,
-                    inp.shape[2],
-                    1,
-                )
-                unfold = nn.Unfold(
-                    self.module.kernel_size + (1,),
-                    dilation=self.module.dilation + (1,),
-                    padding=self.module.padding + (0,),
-                    stride=self.module.stride + (1,),
-                )
-                # output size (batch_size, channels * \prod kernel_size, num_patches)
-                reshaped_inp = unfold(reshaped_inp)
-            else:
-                reshaped_inp = inp.reshape(
-                    inp.size(0) * self.module.groups,
-                    inp.size(1) // self.module.groups,
-                    inp.shape[2],
-                    inp.shape[3],
-                )
-                unfold = nn.Unfold(
-                    self.module.kernel_size,
-                    dilation=self.module.dilation,
-                    padding=self.module.padding,
-                    stride=self.module.stride,
-                )
-                # output size (batch_size, channels * \prod kernel_size, num_patches)
-                reshaped_inp = unfold(reshaped_inp)
-            reshaped_inp = reshaped_inp.transpose(1, 2).flatten(0, 1)
-
-        batch_token_size = reshaped_inp.shape[0]
-
-        if self.H.device != reshaped_inp.device:
-            self.H = self.H.to(device=reshaped_inp.device)
-
-        # moe model may receive an empty batch, return early
-        if batch_token_size == 0:
-            return batch_token_size, reshaped_inp, 0, 0
-
-        beta = self.nsamples / (self.nsamples + batch_token_size)
-        alpha = 2.0 / (self.nsamples + batch_token_size)
-
-        self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta, alpha=alpha)
-
-        # update number of collected samples
-        self.nsamples += batch_token_size
-
-        # inp returned here is flattened/reshaped original inp
-        # return batch_token_size, reshaped_inp, alpha, beta
-        del batch_token_size, reshaped_inp, alpha, beta
+    def process_batch(self, inp, out):
+        if len(inp.shape) == 2:
+            inp = inp.unsqueeze(0)
+        tmp = inp.shape[0]
+        if len(inp.shape) == 3:
+            inp = inp.reshape((-1, inp.shape[-1]))
+        inp = inp.t()
+        self.H *= self.nsamples / (self.nsamples + tmp)
+        self.nsamples += tmp
+        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        self.H = self.H.to(device=self.module.target_device)
+        self.H += inp.matmul(inp.t())
 
     # FIXME, optimum needs fasterquant, we need to remove it
     def fasterquant(
@@ -281,7 +228,8 @@ class GPTQ:
         # self.H = self.H.to(device=CUDA_0)
         # log.info(f"Quantization `{self.name}` using samples: `{self.nsamples}`")
         start = time.time()
-
+        fp_weight = self.module.weight.data.clone()
+        beta = 0.1
         # Temporarily disable torch.compile due to compatibility issues with torch 2.8
         # Will re-enable once the issue is fixed
         # if not TORCH_GTE_28 and not self.qcfg.mock_quantization:
@@ -306,7 +254,7 @@ class GPTQ:
             W = self.module_copy.to(device=self.module.target_device)
             del self.module_copy
 
-        self.quantizer.find_params(W, weight=True)
+        # self.quantizer.find_params(W, weight=True)
 
         H = self.H.to(device=self.module.target_device)
 
@@ -455,6 +403,7 @@ class GPTQ:
                 count = i2 - i1
 
                 W1 = W[:, i1:i2].clone()
+                fp_weight1 = fp_weight[:, i1:i2] # todo
                 Q1 = torch.zeros_like(W1)
                 Err1 = torch.zeros_like(W1)
                 Losses1 = torch.zeros_like(W1)
@@ -463,6 +412,7 @@ class GPTQ:
                     Hinv1 = Hinv[i1:i2, i1:i2]
 
                 for i in range(count):
+                    W1[:, i] -= (W1[:, i]-fp_weight1[:, i]) * beta
                     w = W1[:, i]
                     if Hinv is not None:
                         d = Hinv1[i, i]
@@ -488,14 +438,18 @@ class GPTQ:
                     if Hinv is not None:
                         Losses1[:, i] = (w - q) ** 2 / d**2
                         err1 = (w - q) / d
-                        W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                        # W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                        W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * beta
+
                         Err1[:, i] = err1
 
                 Q[:, i1:i2] = Q1
                 if Hinv is not None:
                     Losses[:, i1:i2] = Losses1 / 2
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+                    # W[:, i2:] -= Err1.matul(Hinv[i1:i2, i2:])
+                    W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * beta
 
+        del fp_weight
         # TODO: why is there a torch_sync here? There are no streaming ops here?
         # torch_sync(device=self.module.target_device)
 
