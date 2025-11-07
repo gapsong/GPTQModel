@@ -127,24 +127,24 @@ class BaseQuantLinear(nn.Module):
                 t.zeros((in_features // self.pack_dtype_bits * self.bits, out_features), dtype=self.pack_dtype),
             )
             
-            if True:
-                # HIER DIE KORREKTE "LEGACY" DIMENSION FÜR QZEROS BERECHNEN
-                # Dies ist nur ein Beispiel, passen Sie es an Ihre Bedürfnisse an.
-                qzeros_shape = (
-                    math.ceil(in_features / self.group_size),
-                    out_features, # Beispiel: Annahme, dass out_features nicht gepackt ist
-                )
-            else:
-                # Standard-Berechnung
-                qzeros_shape = (
-                    math.ceil(in_features / self.group_size),
-                    out_features // self.pack_dtype_bits * self.bits,
-                )
+            zeros_shape = (
+                math.ceil(in_features / self.group_size),
+                out_features, # Beispiel: Annahme, dass out_features nicht gepackt ist
+            )
+            qzeros_shape = (
+                math.ceil(in_features / self.group_size),
+                out_features // self.pack_dtype_bits * self.bits,
+            )
 
             self.register_buffer(
                 "qzeros",
                 t.zeros(qzeros_shape, dtype=self.pack_dtype),
             )
+            
+            # self.register_buffer(
+            #     "zeros",
+            #     t.zeros(zeros_shape, dtype=t.float16),
+            # )
             
             self.register_buffer(
                 "scales",
@@ -200,6 +200,8 @@ class BaseQuantLinear(nn.Module):
             buf.append(self.qweight)
         if hasattr(self, "qzeros") and self.qzeros is not None:
             buf.append(self.qzeros)
+        if hasattr(self, "zeros") and self.zeros is not None:
+            buf.append(self.zeros)
         if hasattr(self, "scales") and self.scales is not None:
             buf.append(self.scales)
         if hasattr(self, "g_idx") and self.g_idx is not None:
@@ -450,9 +452,9 @@ class PackableQuantLinear(BaseQuantLinear):
     def dequantize_weight(self, num_itr: int = 1):
         if self.bits in [2, 4, 8]:
             # Check if qzeros are already in FP16 format (from QALoRA merge)
-            if self.qzeros.dtype == t.float16:
+            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
                 # Use FP16 qzeros directly - these already contain the LoRA shift
-                zeros = self.qzeros
+                zeros = self.zeros
             else:
                 # Original packed integer qzeros - unpack them
                 zeros = t.bitwise_right_shift(
@@ -470,9 +472,9 @@ class PackableQuantLinear(BaseQuantLinear):
             )
         elif self.bits == 3:
             # Check if qzeros are already in FP16 format (from QALoRA merge)
-            if self.qzeros.dtype == t.float16:
+            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
                 # Use FP16 qzeros directly
-                zeros = self.qzeros
+                zeros = self.zeros
             else:
                 # Original packed integer qzeros - unpack them
                 zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(
@@ -500,7 +502,7 @@ class PackableQuantLinear(BaseQuantLinear):
 
         if num_itr == 1:
             # KEY CHANGE: Different formula based on qzeros format
-            if self.qzeros.dtype == t.float16:
+            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
                 # FP16 qzeros already contain the LoRA shift and are in weight space
                 weights = self.scales[self.g_idx.long()] * weight - zeros[self.g_idx.long()]
             else:
@@ -607,7 +609,7 @@ class PackableQuantLinear(BaseQuantLinear):
                 col += 1
 
         self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
-
+        # self.zeros = t.from_numpy(zeros.astype(self.pack_np_dtype))
         # assert
         # assert isinstance(self, TorchQuantLinear), f"type: {self.__class_}"
         # wq = linear.weight.data

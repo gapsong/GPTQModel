@@ -40,6 +40,7 @@ def dequant_kernel(
     scales_ptr,
     qweight_ptr,
     qzeros_ptr,
+    not_packed,
     out_ptr,
     out_dtype: tl.constexpr,
     numels,
@@ -69,29 +70,34 @@ def dequant_kernel(
         tl.load(scales_ptr + (col_idx + out_features * groups), mask=xmask, eviction_policy="evict_last"),
         tl.float32)
 
-    # Load zeros
-    if bits == 3:
-        # For 3-bit, we need to calculate the correct position in the packed zeros
-        zero_bit_pos = (groups * out_features + col_idx) * 3
-        zero_word_idx = zero_bit_pos // 32
-        zero_bit_offset = zero_bit_pos % 32
-
-        zero_word = tl.load(qzeros_ptr + zero_word_idx, mask=xmask, eviction_policy="evict_last")
-
-        # Handle case where 3-bit value is fully within current 32-bit word
-        if zero_bit_offset <= 29:
-            zeros = (zero_word >> zero_bit_offset) & 0b111
-        else:
-            # 3-bit value spans two 32-bit words
-            next_zero_word = tl.load(qzeros_ptr + zero_word_idx + 1, mask=xmask, eviction_policy="evict_last")
-            combined = (zero_word >> zero_bit_offset) | (next_zero_word << (32 - zero_bit_offset))
-            zeros = combined & 0b111
+    if not_packed != 0:
+        # Unpacked zeros: [num_groups, out_features], uint8/int16
+        zeros = tl.load(qzeros_ptr + (qzero_ncols * groups + col_idx // pack_scale), mask=xmask, eviction_policy="evict_last")
+        zeros = tl.cast(zeros, tl.float32)  # ← unified type
     else:
-        qzeros = tl.load(qzeros_ptr + (qzero_ncols * groups + col_idx // pack_scale), mask=xmask,
-                         eviction_policy="evict_last")
-        wf_zeros = (col_idx % pack_scale) * bits
-        zeros = (qzeros >> wf_zeros) & maxq
+        if bits == 3:
+            # For 3-bit, we need to calculate the correct position in the packed zeros
+            zero_bit_pos = (groups * out_features + col_idx) * 3
+            zero_word_idx = zero_bit_pos // 32
+            zero_bit_offset = zero_bit_pos % 32
 
+            zero_word = tl.load(qzeros_ptr + zero_word_idx, mask=xmask, eviction_policy="evict_last")
+
+            # Handle case where 3-bit value is fully within current 32-bit word
+            if zero_bit_offset <= 29:
+                zeros = (zero_word >> zero_bit_offset) & 0b111
+            else:
+                # 3-bit value spans two 32-bit words
+                next_zero_word = tl.load(qzeros_ptr + zero_word_idx + 1, mask=xmask, eviction_policy="evict_last")
+                combined = (zero_word >> zero_bit_offset) | (next_zero_word << (32 - zero_bit_offset))
+                zeros = combined & 0b111
+        else:
+            qzeros = tl.load(qzeros_ptr + (qzero_ncols * groups + col_idx // pack_scale), mask=xmask,
+                            eviction_policy="evict_last")
+            wf_zeros = (col_idx % pack_scale) * bits
+            zeros = (qzeros >> wf_zeros) & maxq
+        
+    # Load zeros
     # Load weights
     if bits == 3:
         # For 3-bit, we need to calculate the correct position in the packed weights
@@ -145,15 +151,15 @@ def dequant(dtype, qweight, scales, qzeros, g_idx, bits, pack_bits, maxq):
 
     out = torch.empty((in_features, out_features), device=qweight.device, dtype=dtype)
     out_dtype = dtype
-
+    not_packed = int(torch_dtype_to_triton(qzeros.dtype) == torch_dtype_to_triton(torch.float16))
     numels = out.numel()
     grid = lambda meta: (triton.cdiv(numels, meta["X_BLOCK"]),)  # noqa: E731
-
     dequant_kernel[grid](
         g_idx,
         scales,
         qweight,
         qzeros,
+        not_packed,
         out,
         torch_dtype_to_triton(out_dtype),
         numels,
