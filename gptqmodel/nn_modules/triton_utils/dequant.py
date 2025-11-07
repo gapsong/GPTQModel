@@ -30,6 +30,7 @@ def dequant_kernel(
     scales_ptr,
     qweight_ptr,
     qzeros_ptr,
+    not_packed,  # 1 if zeros are unpacked float [num_groups, out_features], 0 if packed int
     out_ptr,
     out_dtype: tl.constexpr,
     numels,
@@ -40,7 +41,16 @@ def dequant_kernel(
     num_groups: tl.constexpr,
     X_BLOCK: tl.constexpr,
 ):
-    # Block indexing
+    """
+    Triton kernel for dequantizing GPTQ/SPQR weights with outlier-aware support.
+    
+    Dequantization formulas:
+    - If not_packed != 0 (unpacked float zeros): w_fp = w_int * scale - zero_float
+    - If not_packed == 0 (packed int zeros):     w_fp = (w_int - zero_int) * scale
+    
+    The unpacked format is used when zeros are stored as floats (e.g., from outlier-aware
+    quantization or LoRA merging). The packed format stores zeros as quantized integers.
+    """
     xoffset = tl.program_id(0) * X_BLOCK
     x_index = xoffset + tl.arange(0, X_BLOCK)
     xmask = x_index < numels
@@ -48,67 +58,69 @@ def dequant_kernel(
     col_idx = x_index % out_features
 
     pack_scale: tl.constexpr = pack_bits // bits
-    qzero_ncols: tl.constexpr = out_features // pack_scale
+    # ceil_div für korrekte Spaltenanzahl bei nicht-teilbaren out_features
+    qzero_ncols: tl.constexpr = (out_features + pack_scale - 1) // pack_scale
 
-    # Load group indices
     g_idx = tl.load(g_idx_ptr + row_idx, mask=xmask, eviction_policy="evict_last")
     groups = tl.where(g_idx < 0, g_idx + num_groups, g_idx)
 
-    # Load scales
     scales = tl.cast(
         tl.load(scales_ptr + (col_idx + out_features * groups), mask=xmask, eviction_policy="evict_last"),
-        tl.float32)
+        tl.float32
+    )
 
-    # Load zeros
-    if bits == 3:
-        # For 3-bit, we need to calculate the correct position in the packed zeros
+    # === Zeros laden und auf tl.float32 casten ===
+    if not_packed != 0:
+        # Unpacked: [num_groups, out_features]
+        zeros = tl.load(qzeros_ptr + (groups * out_features + col_idx), mask=xmask, eviction_policy="evict_last")
+        zeros = tl.cast(zeros, tl.float32)
+    elif bits == 3:
+        # 3-bit packed: flat uint32 stream
         zero_bit_pos = (groups * out_features + col_idx) * 3
         zero_word_idx = zero_bit_pos // 32
         zero_bit_offset = zero_bit_pos % 32
 
-        zero_word = tl.load(qzeros_ptr + zero_word_idx, mask=xmask, eviction_policy="evict_last")
+        zero_word = tl.load(qzeros_ptr + zero_word_idx, mask=xmask, eviction_policy="evict_last").to(tl.uint32)
+        within = (zero_bit_offset <= 29)
+        zeros_within = (zero_word >> zero_bit_offset) & 0x7
 
-        # Handle case where 3-bit value is fully within current 32-bit word
-        if zero_bit_offset <= 29:
-            zeros = (zero_word >> zero_bit_offset) & 0b111
-        else:
-            # 3-bit value spans two 32-bit words
-            next_zero_word = tl.load(qzeros_ptr + zero_word_idx + 1, mask=xmask, eviction_policy="evict_last")
-            combined = (zero_word >> zero_bit_offset) | (next_zero_word << (32 - zero_bit_offset))
-            zeros = combined & 0b111
+        next_zero_word = tl.load(qzeros_ptr + zero_word_idx + 1, mask=xmask & ~within, eviction_policy="evict_last").to(tl.uint32)
+        combined = (zero_word >> zero_bit_offset) | (next_zero_word << (32 - zero_bit_offset))
+        zeros = tl.where(within, zeros_within, combined & 0x7).to(tl.float32)
     else:
-        qzeros = tl.load(qzeros_ptr + (qzero_ncols * groups + col_idx // pack_scale), mask=xmask,
-                         eviction_policy="evict_last")
-        wf_zeros = (col_idx % pack_scale) * bits
-        zeros = (qzeros >> wf_zeros) & maxq
+        # 2/4/8-bit packed: [num_groups, qzero_ncols]
+        qzero_word = tl.load(qzeros_ptr + (groups * qzero_ncols + col_idx // pack_scale), mask=xmask, eviction_policy="evict_last").to(tl.uint32)
+        shift = (col_idx % pack_scale) * bits
+        zeros = ((qzero_word >> shift) & maxq).to(tl.float32)
 
-    # Load weights
+    # === Weights laden ===
     if bits == 3:
-        # For 3-bit, we need to calculate the correct position in the packed weights
         weight_bit_pos = (row_idx * out_features + col_idx) * 3
         weight_word_idx = weight_bit_pos // 32
         weight_bit_offset = weight_bit_pos % 32
 
-        weight_word = tl.load(qweight_ptr + weight_word_idx, mask=xmask, eviction_policy="evict_last")
+        weight_word = tl.load(qweight_ptr + weight_word_idx, mask=xmask, eviction_policy="evict_last").to(tl.uint32)
+        within = (weight_bit_offset <= 29)
+        weights_within = (weight_word >> weight_bit_offset) & 0x7
 
-        # Handle case where 3-bit value is fully within current 32-bit word
-        if weight_bit_offset <= 29:
-            weights = (weight_word >> weight_bit_offset) & 0b111
-        else:
-            # 3-bit value spans two 32-bit words
-            next_weight_word = tl.load(qweight_ptr + weight_word_idx + 1, mask=xmask, eviction_policy="evict_last")
-            combined = (weight_word >> weight_bit_offset) | (next_weight_word << (32 - weight_bit_offset))
-            weights = combined & 0b111
+        next_weight_word = tl.load(qweight_ptr + weight_word_idx + 1, mask=xmask & ~within, eviction_policy="evict_last").to(tl.uint32)
+        combined = (weight_word >> weight_bit_offset) | (next_weight_word << (32 - weight_bit_offset))
+        weights = tl.where(within, weights_within, combined & 0x7).to(tl.float32)
     else:
-        qweights = tl.load(qweight_ptr + (col_idx + out_features * (row_idx // pack_scale)), mask=xmask,
-                           eviction_policy="evict_last")
-        wf_weights = (row_idx % pack_scale) * bits
-        weights = (qweights >> wf_weights) & maxq
+        qweight_word = tl.load(qweight_ptr + (col_idx + out_features * (row_idx // pack_scale)), mask=xmask, eviction_policy="evict_last").to(tl.uint32)
+        shift = (row_idx % pack_scale) * bits
+        weights = ((qweight_word >> shift) & maxq).to(tl.float32)
 
-    # Dequantize
-    weights = (weights - zeros).to(tl.float32) * scales
-    weights = tl.cast(weights, out_dtype)
-    tl.store(out_ptr + x_index, weights, mask=xmask)
+    # === Dequantize: formula depends on not_packed ===
+    if not_packed != 0:
+        # Unpacked: zeros are float, use w_int * scale - zero_float
+        weights = weights * scales - zeros
+    else:
+        # Packed: zeros are int, use (w_int - zero_int) * scale
+        weights = (weights - zeros) * scales
+    
+    tl.store(out_ptr + x_index, tl.cast(weights, out_dtype), mask=xmask)
+
 
 
 def torch_dtype_to_triton(dtype):
@@ -124,28 +136,48 @@ def torch_dtype_to_triton(dtype):
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 def dequant(dtype, qweight, scales, qzeros, g_idx, bits, pack_bits, maxq):
-    """
-    Launcher for triton dequant kernel. Supports bits = 2, 3, 4, 8
-    """
     assert bits in [2, 3, 4, 8], "Only 2, 3, 4, 8 bits are supported"
 
     num_groups = scales.shape[0]
     out_features = scales.shape[1]
     in_features = g_idx.shape[0]
 
-    out = torch.empty((in_features, out_features), device=qweight.device, dtype=dtype)
-    out_dtype = dtype
+    # === not_packed aus Shape ableiten ===
+    pack_scale = pack_bits // bits
+    qzero_ncols = (out_features + pack_scale - 1) // pack_scale  # ceil_div
 
+    if qzeros.dim() == 2 and qzeros.shape == (num_groups, out_features):
+        not_packed = 1  # unpacked
+    elif bits == 3 and qzeros.dim() == 1:
+        not_packed = 0  # 3-bit packed (flat stream)
+    elif qzeros.dim() == 2 and qzeros.shape[1] == qzero_ncols:
+        not_packed = 0  # 2/4/8-bit packed
+    else:
+        raise ValueError(
+            f"qzeros shape {qzeros.shape} incompatible: "
+            f"expected unpacked ({num_groups}, {out_features}) or packed ({num_groups}, {qzero_ncols}) for bits={bits}"
+        )
+
+    # === Dtype-Check (optional, für Robustheit) ===
+    qzeros = qzeros.contiguous()
+    if not_packed == 0:
+        # Packed sollte int32/uint32 sein
+        if qzeros.dtype not in (torch.int32, getattr(torch, "uint32", torch.int32)):
+            qzeros = qzeros.to(torch.int32)
+    # Unpacked kann float16/int8/int16 sein (Kernel castet auf float32)
+
+    out = torch.empty((in_features, out_features), device=qweight.device, dtype=dtype)
     numels = out.numel()
-    grid = lambda meta: (triton.cdiv(numels, meta["X_BLOCK"]),)  # noqa: E731
+    grid = lambda meta: (triton.cdiv(numels, meta["X_BLOCK"]),)
 
     dequant_kernel[grid](
         g_idx,
         scales,
         qweight,
         qzeros,
+        int(not_packed),  # shape-basiert, nicht dtype
         out,
-        torch_dtype_to_triton(out_dtype),
+        torch_dtype_to_triton(dtype),
         numels,
         pack_bits=pack_bits,
         maxq=maxq,

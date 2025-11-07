@@ -119,16 +119,22 @@ class BaseQuantLinear(nn.Module):
                 "qweight",
                 t.zeros((in_features // self.pack_dtype_bits * self.bits, out_features), dtype=self.pack_dtype),
             )
+            qzeros_shape = (
+                math.ceil(in_features / self.group_size),
+                out_features // self.pack_dtype_bits * self.bits,
+            )
             self.register_buffer(
                 "qzeros",
                 t.zeros(
-                    (
-                        math.ceil(in_features / self.group_size),
-                        out_features // self.pack_dtype_bits * self.bits,
-                    ),
+                    qzeros_shape,
                     dtype=self.pack_dtype,
                 ),
             )
+            zeros_shape = (
+                math.ceil(in_features / self.group_size),
+                out_features, # Beispiel: Annahme, dass out_features nicht gepackt ist
+            )
+
             self.register_buffer(
                 "scales",
                 t.zeros(
@@ -183,6 +189,8 @@ class BaseQuantLinear(nn.Module):
             buf.append(self.qweight)
         if hasattr(self, "qzeros") and self.qzeros is not None:
             buf.append(self.qzeros)
+        if hasattr(self, "zeros") and self.zeros is not None:
+            buf.append(self.zeros)
         if hasattr(self, "scales") and self.scales is not None:
             buf.append(self.scales)
         if hasattr(self, "g_idx") and self.g_idx is not None:
@@ -431,12 +439,19 @@ class PackableQuantLinear(BaseQuantLinear):
 
     def dequantize_weight(self, num_itr: int = 1):
         if self.bits in [2, 4, 8]:
-            zeros = t.bitwise_right_shift(
-                t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
-                self.wf_unsqueeze_zero  # self.wf.unsqueeze(0),
-            ).to(self.dequant_dtype)
-            zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
-
+            
+            # Check if qzeros are already in FP16 format (from QALoRA merge)
+            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
+                # Use FP16 qzeros directly - these already contain the LoRA shift
+                zeros = self.zeros
+            else:
+                # Original packed integer qzeros - unpack them
+                zeros = t.bitwise_right_shift(
+                    t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
+                    self.wf_unsqueeze_zero
+                ).to(self.dequant_dtype)
+                zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
+            
             weight = t.bitwise_and(
                 t.bitwise_right_shift(
                     t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1),
@@ -445,17 +460,23 @@ class PackableQuantLinear(BaseQuantLinear):
                 self.maxq
             )
         elif self.bits == 3:
-            zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(
-                -1, -1, -1, 12
-            )
-            zeros = zeros >> self.wf_unsqueeze_zero  # self.wf.unsqueeze(0)
-            zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
-            zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
-            zeros = zeros & 0x7
-            zeros = t.cat(
-                [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
-                dim=2,
-            ).reshape(self.scales.shape)
+            # Check if qzeros are already in FP16 format (from QALoRA merge)
+            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
+                # Use FP16 qzeros directly
+                zeros = self.zeros
+            else:
+                # Original packed integer qzeros - unpack them
+                zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(
+                    -1, -1, -1, 12
+                )
+                zeros = zeros >> self.wf_unsqueeze_zero
+                zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
+                zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
+                zeros = zeros & 0x7
+                zeros = t.cat(
+                    [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
+                    dim=2,
+                ).reshape(self.scales.shape)
 
             weight = self.qweight.reshape(self.qweight.shape[0] // 3, 3, 1, self.qweight.shape[1]).expand(
                 -1, -1, 12, -1
@@ -468,7 +489,14 @@ class PackableQuantLinear(BaseQuantLinear):
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
         if num_itr == 1:
-            weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
+            # KEY CHANGE: Different formula based on qzeros format
+            # Check if zeros are unpacked float (either from QALoRA merge or direct unpacked quantization)
+            if hasattr(self, "zeros") and self.zeros.dtype in [t.float16, t.float32, t.bfloat16]:
+                # Unpacked float qzeros: use w_int * scale - zero_float
+                weights = self.scales[self.g_idx.long()] * weight - zeros[self.g_idx.long()]
+            else:
+                # Packed integer qzeros: use (w_int - zero_int) * scale
+                weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
         else:
             num_dim = self.g_idx.shape[0] // num_itr
             weights = []
@@ -477,7 +505,15 @@ class PackableQuantLinear(BaseQuantLinear):
                 weight_i = weight[:, i * num_dim: (i + 1) * num_dim]
                 zeros_i = zeros[:, i * num_dim: (i + 1) * num_dim]
                 g_idx_i = self.g_idx[i * num_dim: (i + 1) * num_dim].long()
-                weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
+
+                # KEY CHANGE: Different formula based on qzeros format
+                # Check if zeros are unpacked float (either from QALoRA merge or direct unpacked quantization)
+                if self.qzeros.dtype in [t.float16, t.float32, t.bfloat16]:
+                    # Unpacked float qzeros: use w_int * scale - zero_float
+                    weights.append(scale_i[g_idx_i] * weight_i - zeros_i[g_idx_i])
+                else:
+                    # Packed integer qzeros: use (w_int - zero_int) * scale
+                    weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
             weights = t.cat(weights, dim=1)
 
         return weights
