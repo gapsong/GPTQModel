@@ -229,7 +229,7 @@ class GPTQ:
         # log.info(f"Quantization `{self.name}` using samples: `{self.nsamples}`")
         start = time.time()
         fp_weight = self.module.weight.data.clone()
-        beta = 0.1
+        beta = 0.00 # beta=0.1 
         # Temporarily disable torch.compile due to compatibility issues with torch 2.8
         # Will re-enable once the issue is fixed
         # if not TORCH_GTE_28 and not self.qcfg.mock_quantization:
