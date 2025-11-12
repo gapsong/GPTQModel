@@ -109,6 +109,7 @@ def quant_matmul_248_kernel(
     stride_cn,
     stride_scales,
     stride_zeros,
+    not_packed: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -120,7 +121,7 @@ def quant_matmul_248_kernel(
     B is of shape (K//8, N) int32
     C is of shape (M, N) float16
     scales is of shape (G, N) float16
-    zeros is of shape (G, N) float16
+    zeros is of shape (G, N) float16 (unpacked) or (G, N//infearure_per_bits) int32 (packed)
     g_ptr is of shape (K) int32
     """
 
@@ -150,7 +151,12 @@ def quant_matmul_248_kernel(
     g_ptrs = g_ptr + offs_k
     # shifter is used to extract the N bits of each element in the 32-bit word from B
     scales_ptrs = scales_ptr + offs_bn[None, :]
-    zeros_ptrs = zeros_ptr + (offs_bn[None, :] // infearure_per_bits)
+    
+    # Adjust zeros_ptrs based on packed/unpacked format
+    if not_packed:
+        zeros_ptrs = zeros_ptr + offs_bn[None, :]
+    else:
+        zeros_ptrs = zeros_ptr + (offs_bn[None, :] // infearure_per_bits)
 
     shifter = (offs_k % infearure_per_bits) * bits
     zeros_shifter = (offs_bn % infearure_per_bits) * bits
@@ -163,14 +169,21 @@ def quant_matmul_248_kernel(
         scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
         zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
 
-        zeros = (zeros >> zeros_shifter[None, :]) & maxq
+        # Unpack zeros only if packed format
+        if not not_packed:
+            zeros = (zeros >> zeros_shifter[None, :]) & maxq
 
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
         b = tl.load(b_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
         # Now we need to unpack b (which is N-bit values) into 32-bit values
         b = (b >> shifter[:, None]) & maxq  # Extract the N-bit values
-        b = (b - zeros) * scales  # Scale and shift
+        
+        # Apply dequantization formula based on format
+        if not_packed:
+            b = b * scales - zeros  # Unpacked: w_int * scale - zero_float
+        else:
+            b = (b - zeros) * scales  # Packed: (w_int - zero_int) * scale
 
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K
@@ -270,6 +283,7 @@ def transpose_quant_matmul_248_kernel(
     stride_cn,
     stride_scales,
     stride_zeros,
+    not_packed: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -281,7 +295,7 @@ def transpose_quant_matmul_248_kernel(
     B is of shape (K//8, N) int32
     C is of shape (M, K) float16
     scales is of shape (G, N) float16
-    zeros is of shape (G, N) float16
+    zeros is of shape (G, N) float16 (unpacked) or (G, N//infearure_per_bits) int32 (packed)
     g_ptr is of shape (K) int32
     """
     # TODO FIXME: pack_dtype ratio is not always 32//bits
@@ -312,7 +326,12 @@ def transpose_quant_matmul_248_kernel(
 
     # shifter is used to extract the N bits of each element in the 32-bit word from B
     scales_ptrs = scales_ptr + offs_n[None, :] + g_idx[:, None] * stride_scales
-    zeros_ptrs = zeros_ptr + (offs_n[None, :] // infearure_per_bits) + g_idx[:, None] * stride_zeros
+    
+    # Adjust zeros_ptrs based on packed/unpacked format
+    if not_packed:
+        zeros_ptrs = zeros_ptr + offs_n[None, :] + g_idx[:, None] * stride_zeros
+    else:
+        zeros_ptrs = zeros_ptr + (offs_n[None, :] // infearure_per_bits) + g_idx[:, None] * stride_zeros
 
     shifter = (offs_bk % infearure_per_bits) * bits
     zeros_shifter = (offs_n % infearure_per_bits) * bits
@@ -323,21 +342,33 @@ def transpose_quant_matmul_248_kernel(
         scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
         zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
 
-        zeros = (zeros >> zeros_shifter[None, :]) & maxq
+        # Unpack zeros only if packed format
+        if not not_packed:
+            zeros = (zeros >> zeros_shifter[None, :]) & maxq
 
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
         b = tl.load(b_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
         # Now we need to unpack b (which is N-bit values) into 32-bit values
         b = (b >> shifter[:, None]) & maxq  # Extract the N-bit values
-        b = (b - zeros) * scales  # Scale and shift
+        
+        # Apply dequantization formula based on format
+        if not_packed:
+            b = b * scales - zeros  # Unpacked: w_int * scale - zero_float
+        else:
+            b = (b - zeros) * scales  # Packed: (w_int - zero_int) * scale
+        
         b = tl.trans(b)
 
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_N
         b_ptrs += BLOCK_SIZE_N
         scales_ptrs += BLOCK_SIZE_N
-        zeros_ptrs += BLOCK_SIZE_N // infearure_per_bits
+        
+        if not_packed:
+            zeros_ptrs += BLOCK_SIZE_N
+        else:
+            zeros_ptrs += BLOCK_SIZE_N // infearure_per_bits
 
     c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bk[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bk[None, :] < K)
@@ -351,6 +382,22 @@ def silu(x):
 
 def quant_matmul_248(input, qweight, scales, qzeros, g_idx, bits, maxq):
     with torch.cuda.device(input.device):
+        # Detect if qzeros is packed or unpacked
+        num_groups = scales.shape[0]
+        out_features = scales.shape[1]
+        pack_scale = 32 // bits
+        qzero_ncols = (out_features + pack_scale - 1) // pack_scale
+        
+        if qzeros.dim() == 2 and qzeros.shape == (num_groups, out_features):
+            not_packed = 1  # unpacked
+        elif qzeros.dim() == 2 and qzeros.shape[1] == qzero_ncols:
+            not_packed = 0  # packed
+        else:
+            raise ValueError(
+                f"qzeros shape {qzeros.shape} incompatible: "
+                f"expected unpacked ({num_groups}, {out_features}) or packed ({num_groups}, {qzero_ncols}) for bits={bits}"
+            )
+        
         output = torch.empty((input.shape[0], qweight.shape[1]), device=input.device, dtype=input.dtype)
         grid = lambda META: (  # noqa: E731
             triton.cdiv(input.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(qweight.shape[1], META["BLOCK_SIZE_N"]),
@@ -375,12 +422,29 @@ def quant_matmul_248(input, qweight, scales, qzeros, g_idx, bits, maxq):
             output.stride(1),
             scales.stride(0),
             qzeros.stride(0),
+            not_packed=not_packed,
         )
         return output
 
 
 def transpose_quant_matmul_248(input, qweight, scales, qzeros, g_idx, bits, maxq):
     with torch.cuda.device(input.device):
+        # Detect if qzeros is packed or unpacked
+        num_groups = scales.shape[0]
+        out_features = scales.shape[1]
+        pack_scale = 32 // bits
+        qzero_ncols = (out_features + pack_scale - 1) // pack_scale
+        
+        if qzeros.dim() == 2 and qzeros.shape == (num_groups, out_features):
+            not_packed = 1  # unpacked
+        elif qzeros.dim() == 2 and qzeros.shape[1] == qzero_ncols:
+            not_packed = 0  # packed
+        else:
+            raise ValueError(
+                f"qzeros shape {qzeros.shape} incompatible: "
+                f"expected unpacked ({num_groups}, {out_features}) or packed ({num_groups}, {qzero_ncols}) for bits={bits}"
+            )
+        
         output_dim = (qweight.shape[0] * 32) // bits
         output = torch.empty((input.shape[0], output_dim), device=input.device, dtype=input.dtype)
         grid = lambda META: (  # noqa: E731
@@ -406,6 +470,7 @@ def transpose_quant_matmul_248(input, qweight, scales, qzeros, g_idx, bits, maxq
             output.stride(1),
             scales.stride(0),
             qzeros.stride(0),
+            not_packed=not_packed,
         )
         return output
 
@@ -433,6 +498,22 @@ class QuantLinearFunction(torch.autograd.Function):
 
 def quant_matmul_inference_only_248(input, qweight, scales, qzeros, g_idx, bits, maxq):
     with torch.cuda.device(input.device):
+        # Detect if qzeros is packed or unpacked
+        num_groups = scales.shape[0]
+        out_features = scales.shape[1]
+        pack_scale = 32 // bits
+        qzero_ncols = (out_features + pack_scale - 1) // pack_scale
+        
+        if qzeros.dim() == 2 and qzeros.shape == (num_groups, out_features):
+            not_packed = 1  # unpacked
+        elif qzeros.dim() == 2 and qzeros.shape[1] == qzero_ncols:
+            not_packed = 0  # packed
+        else:
+            raise ValueError(
+                f"qzeros shape {qzeros.shape} incompatible: "
+                f"expected unpacked ({num_groups}, {out_features}) or packed ({num_groups}, {qzero_ncols}) for bits={bits}"
+            )
+        
         output = torch.empty((input.shape[0], qweight.shape[1]), device=input.device, dtype=input.dtype)
         grid = lambda META: (  # noqa: E731
             triton.cdiv(input.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(qweight.shape[1], META["BLOCK_SIZE_N"]),
@@ -457,6 +538,7 @@ def quant_matmul_inference_only_248(input, qweight, scales, qzeros, g_idx, bits,
             output.stride(1),
             scales.stride(0),
             qzeros.stride(0),
+            not_packed=not_packed,
         )
         return output
 

@@ -499,7 +499,7 @@ class PackableQuantLinear(BaseQuantLinear):
         if num_itr == 1:
             # KEY CHANGE: Different formula based on qzeros format
             # Check if zeros are unpacked float (either from QALoRA merge or direct unpacked quantization)
-            if hasattr(self, "zeros") and self.zeros.dtype in [t.float16, t.float32, t.bfloat16]:
+            if self.qzeros.dtype != t.int32:
                 # Unpacked float qzeros: use w_int * scale - zero_float
                 weights = self.scales[self.g_idx.long()] * weight - zeros[self.g_idx.long()]
             else:
