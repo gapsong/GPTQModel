@@ -132,8 +132,15 @@ class BaseQuantLinear(nn.Module):
             )
             zeros_shape = (
                 math.ceil(in_features / self.group_size),
-                out_features, # Beispiel: Annahme, dass out_features nicht gepackt ist
+                out_features,
             )
+            # self.register_buffer(
+            #     "qzeros",
+            #     t.zeros(
+            #         zeros_shape,
+            #         dtype=t.float16,
+            #     ),
+            # )
 
             self.register_buffer(
                 "scales",
@@ -441,9 +448,10 @@ class PackableQuantLinear(BaseQuantLinear):
         if self.bits in [2, 4, 8]:
             
             # Check if qzeros are already in FP16 format (from QALoRA merge)
-            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
+            # if hasattr(self, "zeros") and self.zeros.dtype == t.float32:
+            if self.qzeros.dtype != t.int32:
                 # Use FP16 qzeros directly - these already contain the LoRA shift
-                zeros = self.zeros
+                zeros = self.qzeros
             else:
                 # Original packed integer qzeros - unpack them
                 zeros = t.bitwise_right_shift(
@@ -461,9 +469,9 @@ class PackableQuantLinear(BaseQuantLinear):
             )
         elif self.bits == 3:
             # Check if qzeros are already in FP16 format (from QALoRA merge)
-            if hasattr(self, "zeros") and self.zeros.dtype == t.float16:
-                # Use FP16 qzeros directly
-                zeros = self.zeros
+            # if hasattr(self, "zeros") and self.zeros.dtype == t.float32:
+            if self.qzeros.dtype != t.int32:                # Use FP16 qzeros directly
+                zeros = self.qzeros
             else:
                 # Original packed integer qzeros - unpack them
                 zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(

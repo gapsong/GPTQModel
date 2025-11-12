@@ -146,29 +146,16 @@ class TritonV2QuantLinear(TorchQuantLinear, TritonModuleMixin):
         #     x = F.pad(x, (0, self.padded_infeatures - self.in_features))
 
         out_shape = x.shape[:-1] + (self.out_features,)
-
-        if hasattr(self, "zeros"):
-            out = QuantLinearFunction.apply(
-                x.reshape(-1, x.shape[-1]),
-                self.qweight,
-                self.scales,
-                self.zeros,
-                self.g_idx,
-                self.bits,
-                self.pack_dtype_bits,
-                self.maxq,
-            ).reshape(out_shape)
-        else:
-            out = QuantLinearFunction.apply(
-                x.reshape(-1, x.shape[-1]),
-                self.qweight,
-                self.scales,
-                self.qzeros,
-                self.g_idx,
-                self.bits,
-                self.pack_dtype_bits,
-                self.maxq,
-            ).reshape(out_shape)
+        out = QuantLinearFunction.apply(
+            x.reshape(-1, x.shape[-1]),
+            self.qweight,
+            self.scales,
+            self.qzeros,
+            self.g_idx,
+            self.bits,
+            self.pack_dtype_bits,
+            self.maxq,
+        ).reshape(out_shape)
 
         if self.bias is not None:
             out.add_(self.bias)
