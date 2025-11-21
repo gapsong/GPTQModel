@@ -183,9 +183,11 @@ class GPTQ:
         self.qcfg.desc_act = actorder
         self.qcfg.act_group_aware = act_group_aware
         self.qcfg.static_groups = static_groups
-        (Q, scale, zero, g_idx, duration, avg_loss, damp_percent, nsamples, Hinv) = self.quantize(blocksize=blocksize)
+        # (Q, scale, zero, g_idx, duration, avg_loss, damp_percent, nsamples, Hinv) = self.quantize(blocksize=blocksize)
+        (Q, scale, zero, g_idx, duration, avg_loss, damp_percent, nsamples) = self.quantize(blocksize=blocksize)
         self.module.weight.data = Q
-        return scale, zero, g_idx, duration, avg_loss, damp_percent, Hinv
+        # return scale, zero, g_idx, duration, avg_loss, damp_percent, Hinv
+        return scale, zero, g_idx, duration, avg_loss, damp_percent
 
     @torch.inference_mode()
     def hessian_inverse(self, H: torch.Tensor):
@@ -454,7 +456,7 @@ class GPTQ:
         # torch_sync(device=self.module.target_device)
 
         if Hinv is not None:
-            # del Hinv
+            del Hinv
             if self.nsamples != 0:
                 avg_loss = torch.sum(Losses).item() / self.nsamples
 
@@ -520,7 +522,8 @@ class GPTQ:
 
         duration = time.time() - start
 
-        return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples, Hinv
+        # return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples, Hinv
+        return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
 
     def free(self):
         if hasattr(self, "H"):
